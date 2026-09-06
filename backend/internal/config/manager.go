@@ -24,8 +24,13 @@ var ErrVersionConflict = errors.New("config.yaml changed since it was loaded")
 // LiveSettings is the subset of config.yaml that the running process can
 // safely apply without rebuilding its long-lived dependencies.
 type LiveSettings struct {
-	NightlyStartTime   string `json:"nightlyStartTime"`
-	BuiltinTagsEnabled bool   `json:"builtinTagsEnabled"`
+	ThumbnailConcurrency   int    `json:"thumbnailConcurrency"`
+	FingerprintConcurrency int    `json:"fingerprintConcurrency"`
+	NightlyDisabled        bool   `json:"nightlyDisabled"`
+	NightlyStartTime       string `json:"nightlyStartTime"`
+	NightlyTimezone        string `json:"nightlyTimezone"`
+	BuiltinTagsEnabled     bool   `json:"builtinTagsEnabled"`
+	PreviewConcurrency     int    `json:"previewConcurrency"`
 }
 
 // LegacyRuntimeSettings carries values written by the short-lived SQLite
@@ -76,8 +81,13 @@ func NewManager(path string) (*Manager, error) {
 
 func DefaultLiveSettings() LiveSettings {
 	return LiveSettings{
-		NightlyStartTime:   DefaultNightlyStartTime,
-		BuiltinTagsEnabled: DefaultBuiltinTagsEnabled,
+		NightlyDisabled:        DefaultNightlyDisabled,
+		NightlyStartTime:       DefaultNightlyStartTime,
+		NightlyTimezone:        DefaultNightlyTimezone,
+		BuiltinTagsEnabled:     DefaultBuiltinTagsEnabled,
+		PreviewConcurrency:     DefaultGenerationConcurrency,
+		ThumbnailConcurrency:   DefaultGenerationConcurrency,
+		FingerprintConcurrency: DefaultGenerationConcurrency,
 	}
 }
 
@@ -86,8 +96,13 @@ func liveSettingsFromConfig(cfg *Config) LiveSettings {
 		return DefaultLiveSettings()
 	}
 	return LiveSettings{
-		NightlyStartTime:   cfg.Nightly.StartTime,
-		BuiltinTagsEnabled: cfg.Tags.IsBuiltinPackEnabled(),
+		NightlyDisabled:        cfg.Nightly.Disabled,
+		NightlyStartTime:       cfg.Nightly.StartTime,
+		NightlyTimezone:        cfg.Nightly.Timezone,
+		BuiltinTagsEnabled:     cfg.Tags.IsBuiltinPackEnabled(),
+		PreviewConcurrency:     cfg.Generation.PreviewConcurrency,
+		ThumbnailConcurrency:   cfg.Generation.ThumbnailConcurrency,
+		FingerprintConcurrency: cfg.Generation.FingerprintConcurrency,
 	}
 }
 
@@ -225,10 +240,11 @@ func (m *Manager) UpdateAdminCredentials(username, password string) error {
 // MigrateLegacyRuntimeSettings performs a one-time schema migration into the
 // real YAML document. Existing YAML values always win over SQLite values;
 // cron_hour is converted to start_time and then removed to avoid two competing
-// fields. The built-in tag switch is migrated from SQLite when the YAML field
-// is absent. The retired duplicate-review switch is removed at the same
-// boundary; comments and unrelated unknown nodes are retained by yaml.Node
-// encoding.
+// fields. Missing timezone values are made explicit so future scheduling no
+// longer depends on the host. The built-in tag switch is migrated from SQLite
+// when the YAML field is absent. Retired settings and the unused drives field
+// are removed at the same boundary; comments and unrelated unknown nodes are
+// retained by yaml.Node encoding.
 func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bool, error) {
 	if m == nil {
 		return false, errors.New("configuration manager is unavailable")
@@ -266,6 +282,10 @@ func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bo
 	if deleteMappingValue(nightly, "cron_hour") {
 		changed = true
 	}
+	if _, exists := mappingValue(nightly, "timezone"); !exists {
+		setScalarValue(nightly, "timezone", parsed.Nightly.Timezone)
+		changed = true
+	}
 	tags, tagsExist := mappingValue(document, "tags")
 	_, builtinTagsExist := mappingValue(tags, "builtin_pack_enabled")
 	if !tagsExist || !builtinTagsExist {
@@ -278,13 +298,22 @@ func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bo
 		changed = true
 	}
 
-	if dedupe, exists := mappingValue(document, "dedupe"); exists {
-		if deleteMappingValue(dedupe, "duplicate_review_enabled") {
-			changed = true
-		}
-		if len(dedupe.Content) == 0 && deleteMappingValue(document, "dedupe") {
-			changed = true
-		}
+	// Drive definitions have always been persisted and loaded from SQLite. Any
+	// YAML drives node is therefore dead configuration and can contain stale
+	// credentials. Remove the complete node regardless of whether it is empty.
+	if deleteMappingValue(document, "drives") {
+		changed = true
+	}
+	// The former per-drive preview limit and shared media budget no longer
+	// control generation. Remove them so the source editor cannot present
+	// ineffective controls alongside the three independent global limits.
+	preview, _ := mappingValue(document, "preview")
+	if deleteMappingValue(preview, "concurrency") {
+		changed = true
+	}
+	generation, _ := mappingValue(document, "generation")
+	if deleteMappingValue(generation, "media_concurrency") {
+		changed = true
 	}
 
 	if !changed {
@@ -454,7 +483,12 @@ func removeLiveDocumentValues(document any) {
 	}
 	removeNestedValue(root, "nightly", "start_time")
 	removeNestedValue(root, "nightly", "cron_hour")
+	removeNestedValue(root, "nightly", "timezone")
+	removeNestedValue(root, "nightly", "disabled")
 	removeNestedValue(root, "tags", "builtin_pack_enabled")
+	removeNestedValue(root, "generation", "preview_concurrency")
+	removeNestedValue(root, "generation", "thumbnail_concurrency")
+	removeNestedValue(root, "generation", "fingerprint_concurrency")
 }
 
 func removeNestedValue(root map[string]any, section, key string) {

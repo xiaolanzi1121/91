@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/video-site/backend/internal/atomicfile"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/localpath"
@@ -61,6 +62,8 @@ type Manager struct {
 	estimate        Estimate
 	estimateUntil   time.Time
 	uploadBusy      map[string]bool
+	uploadWriters   map[string]map[int]context.CancelFunc
+	uploadCanceling map[string]bool
 	uploadLocks     map[string]*uploadSessionLock
 	uploadProgress  map[string]OperationProgress
 	restoreBusy     bool
@@ -113,24 +116,26 @@ func NewManager(cfg Config) (*Manager, error) {
 	dataRoot := filepath.Dir(dbPath)
 	assetRoot := filepath.Dir(previewPath)
 	m := &Manager{
-		catalog:        cfg.Catalog,
-		appConfig:      cfg.AppConfig,
-		configPath:     configPath,
-		appVersion:     normalizedVersion(cfg.AppVersion),
-		dbPath:         dbPath,
-		previewPath:    previewPath,
-		dataRoot:       dataRoot,
-		assetRoot:      assetRoot,
-		backupDir:      filepath.Join(dataRoot, "backups"),
-		snapshotDir:    filepath.Join(dataRoot, ".backup-snapshots"),
-		restoreDir:     filepath.Join(dataRoot, restoreStageDirName),
-		restartManaged: cfg.RestartManaged,
-		now:            cfg.Now,
-		availableBytes: cfg.AvailableBytes,
-		uploadBusy:     make(map[string]bool),
-		uploadLocks:    make(map[string]*uploadSessionLock),
-		uploadProgress: make(map[string]OperationProgress),
-		restart:        make(chan struct{}, 1),
+		catalog:         cfg.Catalog,
+		appConfig:       cfg.AppConfig,
+		configPath:      configPath,
+		appVersion:      normalizedVersion(cfg.AppVersion),
+		dbPath:          dbPath,
+		previewPath:     previewPath,
+		dataRoot:        dataRoot,
+		assetRoot:       assetRoot,
+		backupDir:       filepath.Join(dataRoot, "backups"),
+		snapshotDir:     filepath.Join(dataRoot, ".backup-snapshots"),
+		restoreDir:      filepath.Join(dataRoot, restoreStageDirName),
+		restartManaged:  cfg.RestartManaged,
+		now:             cfg.Now,
+		availableBytes:  cfg.AvailableBytes,
+		uploadBusy:      make(map[string]bool),
+		uploadWriters:   make(map[string]map[int]context.CancelFunc),
+		uploadCanceling: make(map[string]bool),
+		uploadLocks:     make(map[string]*uploadSessionLock),
+		uploadProgress:  make(map[string]OperationProgress),
+		restart:         make(chan struct{}, 1),
 	}
 	m.uploadRoot = filepath.Join(m.backupDir, ".uploads")
 	if m.availableBytes == nil {
@@ -425,35 +430,33 @@ func (m *Manager) estimateLocalStorageResources(ctx context.Context, strict bool
 			if video == nil {
 				continue
 			}
-			for _, fileID := range []string{video.FileID, video.TranscodedFileID} {
-				relative, decodeErr := decodeLocalStorageFileID(fileID)
-				if decodeErr != nil {
-					if strict {
-						return 0, 0, fmt.Errorf("backup: decode local storage file for video %s: %w", video.ID, decodeErr)
-					}
-					continue
+			relative, decodeErr := decodeLocalStorageFileID(video.FileID)
+			if decodeErr != nil {
+				if strict {
+					return 0, 0, fmt.Errorf("backup: decode local storage file for video %s: %w", video.ID, decodeErr)
 				}
-				if relative == "" {
-					continue
-				}
-				candidate := filepath.Join(root, filepath.FromSlash(relative))
-				clean, _, info, ok, resolveErr := resolveContainedRegularFile(root, candidate)
-				if resolveErr != nil {
-					if strict {
-						return 0, 0, fmt.Errorf("backup: inspect local storage file for video %s: %w", video.ID, resolveErr)
-					}
-					continue
-				}
-				if !ok {
-					continue
-				}
-				if _, exists := seen[clean]; exists {
-					continue
-				}
-				seen[clean] = struct{}{}
-				count++
-				size += info.Size()
+				continue
 			}
+			if relative == "" {
+				continue
+			}
+			candidate := filepath.Join(root, filepath.FromSlash(relative))
+			clean, _, info, ok, resolveErr := resolveContainedRegularFile(root, candidate)
+			if resolveErr != nil {
+				if strict {
+					return 0, 0, fmt.Errorf("backup: inspect local storage file for video %s: %w", video.ID, resolveErr)
+				}
+				continue
+			}
+			if !ok {
+				continue
+			}
+			if _, exists := seen[clean]; exists {
+				continue
+			}
+			seen[clean] = struct{}{}
+			count++
+			size += info.Size()
 		}
 	}
 	return count, size, nil
@@ -1120,19 +1123,7 @@ func writeJSONAtomic(filePath string, value any, mode os.FileMode) error {
 		return err
 	}
 	removeTemporary = false
-	directoryHandle, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	syncErr := directoryHandle.Sync()
-	closeErr := directoryHandle.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return atomicfile.SyncDirectory(directory)
 }
 
 func metaPath(archivePath string) string {

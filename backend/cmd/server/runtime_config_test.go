@@ -19,7 +19,7 @@ func TestConfigSavePersistsAndHotUpdatesRuntimeSettings(t *testing.T) {
 	t.Cleanup(func() { _ = cat.Close() })
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("nightly:\n  start_time: \"01:00\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("nightly:\n  start_time: \"01:00\"\n  timezone: Etc/UTC\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := config.NewManager(path)
@@ -32,7 +32,12 @@ func TestConfigSavePersistsAndHotUpdatesRuntimeSettings(t *testing.T) {
 		configManager: manager,
 		onTagsChanged: func() { tagCacheInvalidations++ },
 	}
-	app.nightlyRunner = nightly.New(nightly.Config{Settings: cat, StartTime: manager.LiveSettings().NightlyStartTime})
+	app.nightlyRunner = nightly.New(nightly.Config{
+		Settings:  cat,
+		Disabled:  manager.LiveSettings().NightlyDisabled,
+		StartTime: manager.LiveSettings().NightlyStartTime,
+		Timezone:  manager.LiveSettings().NightlyTimezone,
+	})
 	if err := manager.SetApply(func(settings config.LiveSettings) error {
 		return app.applyLiveConfig(context.Background(), settings)
 	}); err != nil {
@@ -43,7 +48,7 @@ func TestConfigSavePersistsAndHotUpdatesRuntimeSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	next, err := manager.ReplaceYAML([]byte("nightly:\n  start_time: \"00:45\"\ntags:\n  builtin_pack_enabled: false\n"), version)
+	next, err := manager.ReplaceYAML([]byte("nightly:\n  disabled: true\n  start_time: \"00:45\"\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\ngeneration:\n  preview_concurrency: 4\n  thumbnail_concurrency: 2\n  fingerprint_concurrency: 3\n"), version)
 	if err != nil {
 		t.Fatalf("replace config: %v", err)
 	}
@@ -53,8 +58,31 @@ func TestConfigSavePersistsAndHotUpdatesRuntimeSettings(t *testing.T) {
 	if got := app.nightlyRunner.StartTime(); got != "00:45" {
 		t.Fatalf("live scheduler start time = %q, want 00:45", got)
 	}
+	if next.Settings.NightlyTimezone != "Asia/Shanghai" {
+		t.Fatalf("updated settings = %#v", next.Settings)
+	}
+	if got := app.nightlyRunner.Timezone(); got != "Asia/Shanghai" {
+		t.Fatalf("live scheduler timezone = %q, want Asia/Shanghai", got)
+	}
+	if !next.Settings.NightlyDisabled || !app.nightlyRunner.Disabled() {
+		t.Fatalf("live scheduler disabled state was not applied: %#v", next.Settings)
+	}
 	if next.Settings.BuiltinTagsEnabled {
 		t.Fatalf("updated settings = %#v, want built-in tags disabled", next.Settings)
+	}
+	if next.RestartRequired {
+		t.Fatal("preview concurrency should hot update without a restart")
+	}
+	if next.Settings.PreviewConcurrency != 4 || next.Settings.ThumbnailConcurrency != 2 || next.Settings.FingerprintConcurrency != 3 {
+		t.Fatalf("global settings not applied: %+v", next.Settings)
+	}
+	thumbnails, previews, fingerprints := app.generationLimits()
+	assertBudgetAvailable(t, thumbnails, 2)
+	assertBudgetAvailable(t, previews, 4)
+	assertBudgetAvailable(t, fingerprints, 3)
+	latePreview, lateThumb, lateFingerprint := app.newDriveGenerationWorkers(&serverFakeDrive{})
+	if latePreview.Limiter != previews || lateThumb.Limiter != thumbnails || lateFingerprint.Config.Limiter != fingerprints {
+		t.Fatal("late attached drive did not receive live global limits")
 	}
 	enabled, err := cat.BuiltinTagsEnabled(context.Background())
 	if err != nil || enabled {
@@ -101,13 +129,10 @@ func TestMigratedRuntimeSettingsCanBeRemovedFromSQLite(t *testing.T) {
 	if err := cat.SetSetting(ctx, legacyNightlyStartTimeSetting, "03:20"); err != nil {
 		t.Fatal(err)
 	}
-	if err := cat.SetSetting(ctx, obsoleteDuplicateReviewEnabledSetting, "false"); err != nil {
-		t.Fatal(err)
-	}
 	if err := cat.SetSetting(ctx, legacyBuiltinTagsEnabledSetting, "false"); err != nil {
 		t.Fatal(err)
 	}
-	if err := cat.DeleteSettings(ctx, legacyNightlyStartTimeSetting, legacyBuiltinTagsEnabledSetting, obsoleteDuplicateReviewEnabledSetting); err != nil {
+	if err := cat.DeleteSettings(ctx, legacyNightlyStartTimeSetting, legacyBuiltinTagsEnabledSetting); err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := loadLegacyRuntimeSettings(ctx, cat)

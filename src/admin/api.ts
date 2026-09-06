@@ -237,7 +237,6 @@ export type BackupOperationProgress = {
 export type BackupUploadChunk = {
   index: number;
   size: number;
-  sha256: string;
 };
 
 export type BackupUploadSession = {
@@ -310,7 +309,6 @@ export function backupDownloadURL(id: string) {
 export function beginBackupUpload(input: {
   fileName: string;
   size: number;
-  sha256?: string;
 }) {
   return request<BackupUploadSession>("/backup-uploads", {
     method: "POST",
@@ -326,7 +324,6 @@ export async function putBackupUploadChunk(
   id: string,
   index: number,
   chunk: Blob,
-  sha256: string,
   signal?: AbortSignal
 ): Promise<BackupUploadSession> {
   const res = await fetch(
@@ -336,7 +333,6 @@ export async function putBackupUploadChunk(
       credentials: "include",
       headers: {
         "Content-Type": "application/octet-stream",
-        "X-Chunk-SHA256": sha256,
       },
       body: chunk,
       signal,
@@ -357,10 +353,10 @@ export async function putBackupUploadChunk(
   return (await res.json()) as BackupUploadSession;
 }
 
-export function finalizeBackupUpload(id: string) {
+export function finalizeBackupUpload(id: string, sha256: string) {
   return request<BackupRecord>(
     `/backup-uploads/${encodeURIComponent(id)}/finalize`,
-    { method: "POST" }
+    { method: "POST", body: JSON.stringify({ sha256 }) }
   );
 }
 
@@ -385,6 +381,106 @@ export function restoreBackup(
   });
 }
 
+export type BackupTransferState =
+  | "queued"
+  | "connecting"
+  | "uploading"
+  | "finalizing"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export type BackupTransferJob = {
+  id: string;
+  backupId: string;
+  backupName: string;
+  targetUrl: string;
+  state: BackupTransferState | string;
+  size: number;
+  sha256: string;
+  processedBytes: number;
+  bytesPerSecond: number;
+  totalRanges?: number;
+  processedRanges?: number;
+  attempts?: number;
+  nextAttemptAt?: string;
+  error?: string;
+  targetBackupId?: string;
+  targetBackupName?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  finishedAt?: string;
+  cancellable: boolean;
+  retryable: boolean;
+};
+
+export type BackupReceiveToken = {
+  id: string;
+  token: string;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export type BackupReceiveTransfer = {
+  id: string;
+  sourceServerId: string;
+  backupId: string;
+  backupName: string;
+  state: BackupTransferState | string;
+  size: number;
+  processedBytes: number;
+  bytesPerSecond: number;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  targetBackupId?: string;
+  error?: string;
+  cancellable: boolean;
+};
+
+export function listBackupTransfers() {
+  return request<BackupTransferJob[]>("/backup-transfers");
+}
+
+export function listBackupReceiveTransfers() {
+  return request<BackupReceiveTransfer[]>("/backup-receives");
+}
+
+export function cancelBackupReceiveTransfer(id: string) {
+  return request<void>(`/backup-receives/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function createBackupTransfer(
+  backupId: string,
+  input: { targetUrl: string; receiveToken: string }
+) {
+  return request<BackupTransferJob>(
+    `/backups/${encodeURIComponent(backupId)}/transfers`,
+    { method: "POST", body: JSON.stringify(input) }
+  );
+}
+
+export function cancelBackupTransfer(id: string) {
+  return request<BackupTransferJob>(`/backup-transfers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function retryBackupTransfer(id: string) {
+  return request<BackupTransferJob>(
+    `/backup-transfers/${encodeURIComponent(id)}/retry`,
+    { method: "POST" }
+  );
+}
+
+export function createBackupReceiveToken() {
+  return request<BackupReceiveToken>("/backup-receive-tokens", { method: "POST" });
+}
+
 // ---------- Drives ----------
 
 export type AdminDrive = {
@@ -395,11 +491,14 @@ export type AdminDrive = {
   status: string;
   lastError?: string;
   hasCredential: boolean;
+  /** 后端能力表声明该挂载可写入文件；爬虫上传目标据此展示。 */
+  canUpload: boolean;
   /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
   teaserEnabled: boolean;
   /**
    * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
    * 命中其中任一目录时 scanner 直接跳过、不递归；空数组 = 不跳过任何目录。
+   * 名单变化后的下一次扫盘会先从媒体库清理对应目录，不删除网盘源文件。
    * 替代旧版硬编码 p115 "影视" 目录例外分支。
    */
   skipDirIds: string[];
@@ -419,15 +518,10 @@ export type AdminDrive = {
   fingerprintReadyCount: number;
   fingerprintPendingCount: number;
   fingerprintFailedCount: number;
-  // 浏览器兼容性转码：候选(待处理)/已转码/失败/检测后无需转码 计数与任务状态。
-  transcodeGenerationStatus?: DriveGenerationStatus;
-  transcodePendingCount: number;
-  transcodeReadyCount: number;
-  transcodeFailedCount: number;
-  transcodeSkippedCount: number;
 };
 
 export type DriveGenerationStatus = {
+  result?: ScanResult;
   state: string;
   currentTitle?: string;
   queueLength: number;
@@ -478,8 +572,15 @@ export type UpsertDriveInput = {
   skipDirIds?: string[];
 };
 
+export type DriveConfigSaveResult = {
+  ok: boolean;
+  deferred?: boolean;
+  message?: string;
+  warning?: string;
+};
+
 export function upsertDrive(body: UpsertDriveInput) {
-  return request<{ ok: boolean; warning?: string }>("/drives", {
+  return request<DriveConfigSaveResult>("/drives", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -521,6 +622,7 @@ export type AdminCrawler = {
   scriptPath: string;
   scriptSourceUrl?: string;
   proxy?: string;
+  uploadProxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
   paused: boolean;
@@ -550,6 +652,7 @@ export type UpsertCrawlerInput = {
   scriptPath: string;
   scriptSourceUrl?: string;
   proxy?: string;
+  uploadProxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
 };
@@ -591,7 +694,7 @@ export function listCrawlers() {
 }
 
 export function upsertCrawler(body: UpsertCrawlerInput) {
-  return request<{ ok: boolean; id: string; warning?: string }>("/crawlers", {
+  return request<DriveConfigSaveResult & { id: string }>("/crawlers", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -791,11 +894,11 @@ export function getGuangYaPanQRStatus(deviceCode: string) {
 /**
  * 切换某个云盘的预览视频生成开关。点击网盘列表里行内的 toggle 按钮时调用。
  *
- * 后端会写 catalog.drives.teaser_enabled，并在从关到开时立刻补扫该盘 pending 预览视频；
- * 关闭分支不补做任何事，新的入队判断会自动停。
+ * 后端会写 catalog.drives.teaser_enabled；空闲时立即生效，有任务时返回
+ * deferred=true 并在当前任务结束后切换。
  */
 export function setDriveTeaserEnabled(id: string, enabled: boolean) {
-  return request<{ ok: boolean; teaserEnabled: boolean }>(
+  return request<DriveConfigSaveResult & { teaserEnabled: boolean }>(
     `/drives/${encodeURIComponent(id)}/teaser-enabled`,
     {
       method: "POST",
@@ -829,10 +932,10 @@ export function listDriveDirChildren(id: string, parentId?: string) {
 
 /**
  * 整体覆盖某盘的"扫描跳过目录"集合（drive 侧目录 fileID）。
- * 传空数组 = 清空跳过列表。下次扫描时生效，不会立刻重扫。
+ * 传空数组 = 清空跳过列表。不会立刻重扫或删除；下次扫描时执行策略清理。
  */
 export function setDriveSkipDirIds(id: string, dirIds: string[]) {
-  return request<{ ok: boolean; skipDirIds: string[] }>(
+  return request<DriveConfigSaveResult & { skipDirIds: string[] }>(
     `/drives/${encodeURIComponent(id)}/skip-dirs`,
     {
       method: "POST",
@@ -869,26 +972,6 @@ export function regenFailedFingerprints(id: string) {
   );
 }
 
-/**
- * 手动开启某存储的浏览器兼容性转码（AVI/WMV 等浏览器播不动的视频转 H.264 MP4，
- * 产物上传回同一存储）。转码默认关闭、从不自动运行，这是唯一入口；
- * 任务处理完候选列表后自然结束。
- */
-export function startDriveTranscode(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string }>(
-    `/drives/${encodeURIComponent(id)}/transcode/start`,
-    { method: "POST" }
-  );
-}
-
-/** 手动停止某存储正在进行的转码任务。 */
-export function stopDriveTranscode(id: string) {
-  return request<{ ok: boolean; stopped: boolean }>(
-    `/drives/${encodeURIComponent(id)}/transcode/stop`,
-    { method: "POST" }
-  );
-}
-
 // ---------- Videos ----------
 
 export type AdminVideo = {
@@ -903,7 +986,6 @@ export type AdminVideo = {
   durationSeconds: number;
   size: number;
   ext: string;
-  quality: string;
   thumbnailUrl: string;
   previewStatus: string;
   views: number;
@@ -974,7 +1056,8 @@ export type AdminDeletedVideo = {
   sourceDeleted: boolean;
   canonicalVideoId?: string;
   canonicalTitle?: string;
-  restorePolicy: "none" | "scan" | "crawler";
+  // direct：本地上传这类无法被扫盘/爬取重新发现的来源，取消拉黑时当场重建记录。
+  restorePolicy: "none" | "scan" | "crawler" | "direct";
   deletedAt: number;
 };
 
@@ -1011,6 +1094,7 @@ export type BlacklistSourceDeleteStatus = {
   total: number;
   processed: number;
   deleted: number;
+  skipped: number;
   failed: number;
   currentFile?: string;
   lastError?: string;
@@ -1043,7 +1127,6 @@ export type UpdateVideoInput = Partial<{
   badges: string[];
   description: string;
   thumbnail: string;
-  quality: string;
   durationSeconds: number;
 }>;
 
@@ -1155,8 +1238,13 @@ export type ConfigSaveResult = {
   version: string;
   restartRequired: boolean;
   settings: {
+    nightlyDisabled: boolean;
     nightlyStartTime: string;
+    nightlyTimezone: string;
     builtinTagsEnabled: boolean;
+    previewConcurrency: number;
+    thumbnailConcurrency: number;
+    fingerprintConcurrency: number;
   };
 };
 
@@ -1222,6 +1310,25 @@ export async function updateConfigYAML(
 
 // ---------- Jobs ----------
 
+export type ScanOutcome = "succeeded" | "partial" | "failed" | "canceled" | "skipped";
+
+export type ScanIssue = { stage: string; message: string };
+
+export type ScanResult = {
+  driveId: string;
+  state: ScanOutcome;
+  startedAt: string;
+  finishedAt: string;
+  scannedCount: number;
+  addedCount: number;
+  updatedCount: number;
+  duplicateCount: number;
+  tombstonedCount: number;
+  errorCount: number;
+  message?: string;
+  issues?: ScanIssue[];
+};
+
 /**
  * 扫描所有已配置的真实网盘，等待新视频资产处理完成后执行全库视频去重。
  * 不触发脚本爬虫、爬虫上传或恢复，也不占用当天的定时 nightly 执行标记。
@@ -1233,6 +1340,9 @@ export type MaintenanceJobStatus = {
   queued: boolean;
   startedAt?: string;
   lastFinishedAt?: string;
+  outcome?: ScanOutcome;
+  scanResults?: ScanResult[];
+  issues?: ScanIssue[];
 };
 
 export function getScanAllJobStatus() {
